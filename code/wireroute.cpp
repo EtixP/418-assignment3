@@ -15,6 +15,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <climits>
 
 #include <omp.h>
 #include <unistd.h>
@@ -39,6 +40,12 @@ void print_stats(const std::vector<std::vector<int>> &occupancy) {
 (2) It convert wires from Wire to validate_wire_t by to_validate_format
 (2) It write wires into another file
 */
+
+struct Candidate{
+  long long cost;
+  Wire route;    
+};
+
 void write_output(
     const std::vector<Wire> &wires, const int num_wires,
     const std::vector<std::vector<int>> &occupancy, const int dim_x,
@@ -84,6 +91,139 @@ void write_output(
   out_wires.close();
 }
 
+// Helper function to either subtract or add wire in occupancy
+void apply_wire(const Wire &w, std::vector<std::vector<int>> &occupancy, int change){
+  validate_wire_t vw = w.to_validate_format().cleanup();
+
+  for(int i=0; i<vw.num_pts-1; i++){
+    int x=vw.p[i].x;
+    int y=vw.p[i].y;
+    int xn=vw.p[i+1].x;
+    int yn=vw.p[i+1].y;
+    int sx=(xn>x)?1:(xn<x?-1:0);
+    int sy=(yn>y)?1:(yn<y?-1:0);
+    
+    while(x!=xn || y!=yn){
+      occupancy[y][x] += change;
+      x+=sx;
+      y+=sy;
+    }
+    if(i==vw.num_pts-2) occupancy[y][x]+=change; //Account for last point
+  }
+}
+
+int sgn(int v){
+  return (v>0)-(v<0);
+}
+
+int count_candidates(Wire &w){
+  int dx = std::abs(w.end_x-w.start_x);
+  int dy = std::abs(w.end_y-w.start_y);
+
+  if(dx==0||dy==0) return 1;
+  return 2+(dx-1)+(dy-1)+2*(dx-1)*(dy-1);
+}
+
+Wire candidate_from_id(Wire &base, int cid){
+  int x0 = base.start_x, y0 = base.start_y;
+  int x1 = base.end_x, y1 = base.end_y;
+  int dx = std::abs(x1-x0), dy = std::abs(y1-y0);
+  int sx = sgn(x1-x0), sy = sgn(y1-y0);
+
+  Wire w = base;
+
+  //Straight line
+  if (dx == 0 || dy == 0) {
+    w.move_x_start = true;
+    w.move_x_end = false;
+    w.mid_x = x1;
+    w.mid_y = y0;
+    return w;
+  }
+
+  //1 bend
+  if(cid == 0) { // horizontal first
+    w.move_x_start = true;
+    w.move_x_end = false;
+    w.mid_x = x1;
+    w.mid_y = y0;
+    return w;
+  }
+  if(cid == 1) { // vertical first
+    w.move_x_start = false;
+    w.move_x_end = true;
+    w.mid_x = x0;
+    w.mid_y = y1;
+    return w;
+  }
+  cid -= 2;
+
+  //2 bend
+  if(cid<dx-1){ 
+    int xm = x0+sx*(cid+1);
+    w.move_x_start = true;
+    w.move_x_end = true;
+    w.mid_x = xm;
+    w.mid_y = y1;
+    return w;
+  }
+  cid -= (dx-1);
+
+  if(cid < dy - 1) {
+    int ym = y0 + sy * (cid + 1); // interior y
+    w.move_x_start = false;
+    w.move_x_end = false;
+    w.mid_x = x1;
+    w.mid_y = ym;
+    return w;
+  }
+  cid -= (dy-1);
+
+  //3 bend
+  int interior = (dx - 1)*(dy - 1);
+  int orient = cid / interior;      // 0: HF, 1: VF
+  int idx = cid % interior;
+
+  int k = idx % (dx - 1) + 1;       // x interior index
+  int l = idx / (dx - 1) + 1;       // y interior index
+  int xm = x0 + sx * k;
+  int ym = y0 + sy * l;
+
+  w.mid_x = xm;
+  w.mid_y = ym;
+  if (orient == 0) {                 // Horizontal: x->y then x->y
+    w.move_x_start = true;
+    w.move_x_end = true;
+  } else {                           // Vertical: y->x then y->x
+    w.move_x_start = false;
+    w.move_x_end = false;
+  }
+  return w;
+
+}
+
+long long route_add_cost(const Wire &candi, const std::vector<std::vector<int>> &occupancy){
+  validate_wire_t vw = candi.to_validate_format().cleanup();
+  long long tot = 0;
+  for (int i = 0; i < vw.num_pts - 1; ++i) {
+    int x = vw.p[i].x,     y = vw.p[i].y;
+    int xn = vw.p[i + 1].x, yn = vw.p[i + 1].y;
+    int sx = (xn > x) ? 1 : (xn < x ? -1 : 0);
+    int sy = (yn > y) ? 1 : (yn < y ? -1 : 0);
+
+    while (x != xn || y != yn) {
+      int n = occupancy[y][x];
+      tot += 2LL * n + 1;            // (n+1)^2 - n^2
+      x += sx;
+      y += sy;
+    }
+    if (i == vw.num_pts - 2) {       // final endpoint exactly once
+      int n = occupancy[y][x];
+      tot += 2LL * n + 1;
+    }
+  }
+  return tot;
+}
 
 int main(int argc, char *argv[]) {
   const auto init_start = std::chrono::steady_clock::now();
@@ -169,6 +309,9 @@ int main(int argc, char *argv[]) {
   }
 
   /* Initialize any additional data structures needed in the algorithm */
+  for (const auto &wire : wires) {
+    apply_wire(wire, occupancy, +1);
+  }
 
   // Student code end
   const double init_time =
@@ -188,8 +331,44 @@ int main(int argc, char *argv[]) {
   
   // initialize wires
   // Within wires
+
   if (parallel_mode == 'W') {
     // within wires
+    for(auto &wire:wires){
+      apply_wire(wire, occupancy, -1);
+      int total = count_candidates(wire);
+      Candidate global_best{LLONG_MAX,wire};
+      int global_best_id=-1;
+
+      #pragma omp parallel
+      {
+        Candidate local_best{LLONG_MAX,wire};
+        int local_best_id = -1;
+        #pragma omp for schedule(dynamic)
+        for(int cid=0; cid<total; cid++){
+          Wire candi = candidate_from_id(wire, cid);
+          long long c = route_add_cost(candi, occupancy);
+
+          if(c<local_best.cost){
+            local_best.cost = c;
+            local_best.route = candi;
+            local_best_id = cid;
+          }
+        }
+
+        #pragma omp critical
+        {
+          if(local_best.cost<global_best.cost){
+            global_best = local_best;
+            global_best_id = local_best_id;
+          }
+        }
+
+      }
+      wire = global_best.route;
+      apply_wire(wire, occupancy, 1);
+    }
+    
   } else {
     // across wires
   }
@@ -215,8 +394,44 @@ int main(int argc, char *argv[]) {
   validate_wire_t keypoint representation in order to run checker and
   write output
 */
+struct Point {
+    int x;
+    int y;
+};
+
+// Helper to skip duplicates with the previous point
+static void add_point(std::vector<Point>& pts, int x, int y) {
+    if (!pts.empty() && pts.back().x == x && pts.back().y == y) return;
+    pts.push_back({x, y});
+}
+
 validate_wire_t Wire::to_validate_format(void) const {
-  validate_wire_t w;
-  
-  return w;
+    validate_wire_t w;
+
+    std::vector<Point> pt_arr;
+    pt_arr.reserve(MAX_PTS_PER_WIRE);
+
+    add_point(pt_arr, start_x, start_y);
+    if(move_x_start) add_point(pt_arr, mid_x, start_y);
+    else add_point(pt_arr, start_x, mid_y);
+    add_point(pt_arr, mid_x, mid_y);
+
+    if(move_x_end) add_point(pt_arr, end_x, mid_y);
+    else add_point(pt_arr, mid_x, end_y);
+    add_point(pt_arr, end_x, end_y);
+
+    for (size_t i = 1; i + 1 < pt_arr.size(); ) {
+        bool same_x = (pt_arr[i-1].x == pt_arr[i].x) && (pt_arr[i].x == pt_arr[i+1].x);
+        bool same_y = (pt_arr[i-1].y == pt_arr[i].y) && (pt_arr[i].y == pt_arr[i+1].y);
+        if (same_x || same_y) pt_arr.erase(pt_arr.begin() + i);
+        else ++i;
+    }
+
+    w.num_pts = static_cast<uint8_t>(pt_arr.size());
+    for (size_t i = 0; i < pt_arr.size(); ++i) {
+        w.p[i].x = static_cast<uint16_t>(pt_arr[i].x);
+        w.p[i].y = static_cast<uint16_t>(pt_arr[i].y);
+    }
+
+    return w;
 }
