@@ -84,6 +84,19 @@ void write_output(
   out_wires.close();
 }
 
+// helper to initialize all necessary components before stepping into T = 1
+void initialize() {}
+
+// helper for greedy search of each wire's best route
+void routing(Wire w) {}
+
+// generate a set of all possible routes for a given wires[wire_index]
+std::vector<validate_wire_t>
+    candidates generate_candidates(std::vector<Wire> wires, size_t wire_index) {
+}
+
+// naive static assignment implemention of processing batch of wire
+void batch_process() {}
 
 int main(int argc, char *argv[]) {
   const auto init_start = std::chrono::steady_clock::now();
@@ -158,7 +171,7 @@ int main(int argc, char *argv[]) {
   std::cout << "Question Spec: dim_x=" << dim_x << ", dim_y=" << dim_y
             << ", number of wires=" << num_wires << '\n';
 
-  // TODO (student code start): Read the wire information from file, 
+  // TODO (student code start): Read the wire information from file,
   // you may need to change this if you define the wire structure differently.
   for (auto &wire : wires) {
     fin >> wire.start_x >> wire.start_y >> wire.end_x >> wire.end_y;
@@ -180,43 +193,108 @@ int main(int argc, char *argv[]) {
 
   const auto compute_start = std::chrono::steady_clock::now();
 
-  /* TODO (student code start): Implement the wire routing algorithm here and
+  /*
+    TODO (student code start): Implement the wire routing algorithm here and
     feel free to structure the algorithm into different functions.
     Don't use global variables.
     Use OpenMP to parallelize the algorithm.
   */
-  
+  std::mt19937 rng(std::random_device{}()); // seeding for a random number for probablistic on SA_prob
+
+  // ! 1. Randomize the initial routing of every wire
+  // ! 2. Place the initialized wire routing cost into occupancy matrix
+  initialize();
+
   // initialize wires
   // Within wires
   if (parallel_mode == 'W') {
     // within wires
-  } else {
+
+    for (size_t iter = 0; iter < SA_iters; ++iter) {
+      for (size_t i = 0; i < num_wires; ++i) {
+        // generate all possible route candidates
+        std::vector<validate_wire_t> candidates = generate_candidates(wires, i);
+
+        // ! if P is hit choose a route randomly from the set of all candidates
+        if (std::bernoulli_distribution(p)(rng)){
+          // update wire
+          update_wire(wires, i);
+          continue;
+        }
+
+        // !create a validate_wire_t object for current wire formation if we did not hit P
+
+        // grab total (increased) cost of current wire route
+        size_t best_cost = eval_cost(wires, i);
+
+        // store a global best route
+        validate_wire_t best_route{};
+
+        // ! temporary remove the current wire route for later calulation
+
+        // parallelize threads for candidate eval
+        #pragma omp parallel num_threads(num_threads) {
+          size_t local_best{};
+          validate_wire_t local_broute{};
+
+          // parallelize the next for loop via static assignment
+          #pragma omp for schedule(static)
+            for (size_t can_index = 0; can_index < candidates.size(); ++can_index){
+              size_t route_cost = eval_cost(wires, can_index)
+              
+              // update thread best cost and route if found cheaper
+              if(route_cost < local_best){
+                local_best = route_cost;
+
+                // ! this read leads to a lot of shared address read on candidates
+                local_broute = candidates[can_index];
+              }
+            }
+            
+            // critical update section
+            #pragma omp critical{
+              // update best_cost if better
+              if(local_best < best_cost){
+                best_cost = local_best;
+                best_route = local_broute;
+              }
+            }
+        }
+
+        // ! update wire formation
+
+        // ! update occupancy matrux
+      }
+    }
+  }
+  else {
     // across wires
   }
 
-  // Student code end
-  // DON'T CHANGE THE FOLLOWING CODE
-  const double compute_time =
-      std::chrono::duration_cast<std::chrono::duration<double>>(
-          std::chrono::steady_clock::now() - compute_start)
-          .count();
-  std::cout << "Computation time (sec): " << compute_time << '\n';
+// Student code end
+// DON'T CHANGE THE FOLLOWING CODE
+const double compute_time =
+    std::chrono::duration_cast<std::chrono::duration<double>>(
+        std::chrono::steady_clock::now() - compute_start)
+        .count();
+std::cout << "Computation time (sec): " << compute_time << '\n';
 
-  /* wire to run check on wires and occupancy */
-  wr_checker checker(wires, occupancy);
-  checker.validate();
+/* wire to run check on wires and occupancy */
+wr_checker checker(wires, occupancy);
+checker.validate();
 
-  /* Write wires and occupancy matrix to files */
-  print_stats(occupancy);
-  write_output(wires, num_wires, occupancy, dim_x, dim_y);
+/* Write wires and occupancy matrix to files */
+print_stats(occupancy);
+write_output(wires, num_wires, occupancy, dim_x, dim_y);
 }
 
-/* TODO (student): implement to_validate_format to convert Wire to
+/*
+  TODO (student): implement to_validate_format to convert Wire to
   validate_wire_t keypoint representation in order to run checker and
   write output
 */
 validate_wire_t Wire::to_validate_format(void) const {
   validate_wire_t w;
-  
+
   return w;
 }

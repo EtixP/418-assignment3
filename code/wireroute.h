@@ -50,7 +50,8 @@ struct validate_wire_t {
   void print_wire(void) const;
 };
 
-/* TODO (student): Define the data structure for wire here.
+/* 
+TODO (student): Define the data structure for wire here.
 Feel free to redefine this, notice you also need to change how bend is read in
 inside main of wireroute.cpp.
 
