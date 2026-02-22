@@ -84,19 +84,24 @@ void write_output(
   out_wires.close();
 }
 
-// helper to initialize all necessary components before stepping into T = 1
+// ! helper to initialize all necessary components before stepping into T = 1
 void initialize() {}
 
-// helper for greedy search of each wire's best route
+// ! helper for greedy search of each wire's best route
 void routing(Wire w) {}
 
-// generate a set of all possible routes for a given wires[wire_index]
-std::vector<validate_wire_t>
-    candidates generate_candidates(std::vector<Wire> wires, size_t wire_index) {
+// ! generate a set of all possible routes for a given wires[wire_index]
+std::vector<validate_wire_t> generate_candidates(std::vector<Wire> wires, size_t wire_index) {
 }
 
-// naive static assignment implemention of processing batch of wire
-void batch_process() {}
+// ! update the wire abstraction using the candidate wire and rewrite the occupancy matrix
+void update_wire(std::vector<Wire> wires, size_t wire_index, validate_wire_t candidate){
+
+}
+
+// ! function to evaluate the cost of choosing a given candidate route for a wire
+size_t eval_cost(std::vector<Wire> wires, size_t candidate_index){}
+
 
 int main(int argc, char *argv[]) {
   const auto init_start = std::chrono::steady_clock::now();
@@ -211,21 +216,25 @@ int main(int argc, char *argv[]) {
     // within wires
 
     for (size_t iter = 0; iter < SA_iters; ++iter) {
-      for (size_t i = 0; i < num_wires; ++i) {
+      for (size_t wire_index = 0; wire_index < num_wires; ++wire_index) {
         // generate all possible route candidates
-        std::vector<validate_wire_t> candidates = generate_candidates(wires, i);
+        std::vector<validate_wire_t> candidates = generate_candidates(wires, wire_index);
 
         // ! if P is hit choose a route randomly from the set of all candidates
-        if (std::bernoulli_distribution(p)(rng)){
+        if (std::bernoulli_distribution(SA_prob)(rng)){
+
+          size_t random_index = std::uniform_int_distribution<std::size_t>(0, candidates.size() - 1)(rng);
+
+
           // update wire
-          update_wire(wires, i);
+          update_wire(wires, wire_index, candidates[random_index]);
           continue;
         }
 
         // !create a validate_wire_t object for current wire formation if we did not hit P
 
         // grab total (increased) cost of current wire route
-        size_t best_cost = eval_cost(wires, i);
+        size_t best_cost = eval_cost(wires, wire_index);
 
         // store a global best route
         validate_wire_t best_route{};
@@ -233,14 +242,15 @@ int main(int argc, char *argv[]) {
         // ! temporary remove the current wire route for later calulation
 
         // parallelize threads for candidate eval
-        #pragma omp parallel num_threads(num_threads) {
-          size_t local_best{};
+        #pragma omp parallel num_threads(num_threads) 
+        {
+          size_t local_best{SIZE_MAX};
           validate_wire_t local_broute{};
 
           // parallelize the next for loop via static assignment
           #pragma omp for schedule(static)
             for (size_t can_index = 0; can_index < candidates.size(); ++can_index){
-              size_t route_cost = eval_cost(wires, can_index)
+              size_t route_cost = eval_cost(wires, can_index);
               
               // update thread best cost and route if found cheaper
               if(route_cost < local_best){
@@ -252,7 +262,8 @@ int main(int argc, char *argv[]) {
             }
             
             // critical update section
-            #pragma omp critical{
+            #pragma omp critical
+            {
               // update best_cost if better
               if(local_best < best_cost){
                 best_cost = local_best;
@@ -261,8 +272,8 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // ! update wire formation
-
+        // ! update wire formation and occupancy matrix
+        update_wire(wires, wire_index, best_route);
         // ! update occupancy matrux
       }
     }
