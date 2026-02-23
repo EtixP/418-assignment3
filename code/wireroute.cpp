@@ -217,7 +217,7 @@ long long route_add_cost(const Wire &candi, const std::vector<std::vector<int>> 
       x += sx;
       y += sy;
     }
-    if (i == vw.num_pts - 2) {       // final endpoint exactly once
+    if (i == vw.num_pts - 2) {  // final endpoint exactly once
       int n = occupancy[y][x];
       tot += 2LL * n + 1;
     }
@@ -310,7 +310,7 @@ int main(int argc, char *argv[]) {
 
   /* Initialize any additional data structures needed in the algorithm */
   for (const auto &wire : wires) {
-    apply_wire(wire, occupancy, +1);
+    apply_wire(wire, occupancy, 1);
   }
 
   // Student code end
@@ -332,18 +332,19 @@ int main(int argc, char *argv[]) {
   // initialize wires
   // Within wires
 
+  omp_set_dynamic(0);
+  omp_set_num_threads(num_threads);
+
   if (parallel_mode == 'W') {
     // within wires
     for(auto &wire:wires){
       apply_wire(wire, occupancy, -1);
       int total = count_candidates(wire);
       Candidate global_best{LLONG_MAX,wire};
-      int global_best_id=-1;
 
       #pragma omp parallel
       {
         Candidate local_best{LLONG_MAX,wire};
-        int local_best_id = -1;
         #pragma omp for schedule(dynamic)
         for(int cid=0; cid<total; cid++){
           Wire candi = candidate_from_id(wire, cid);
@@ -352,7 +353,6 @@ int main(int argc, char *argv[]) {
           if(c<local_best.cost){
             local_best.cost = c;
             local_best.route = candi;
-            local_best_id = cid;
           }
         }
 
@@ -360,7 +360,6 @@ int main(int argc, char *argv[]) {
         {
           if(local_best.cost<global_best.cost){
             global_best = local_best;
-            global_best_id = local_best_id;
           }
         }
 
