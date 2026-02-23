@@ -1,3 +1,4 @@
+#To run, type "bash bench_within.sh" in bash
 export OMP_PROC_BIND=true
 export OMP_PLACES=cores
 
@@ -6,7 +7,7 @@ echo "input,threads,run,init_sec,compute_sec,max_occ,total_cost,validate" > "$ou
 
 for f in inputs/timeinput/*.txt; do
   for t in 1 2 4 8; do
-    for r in 1 2 3; do
+    for r in 1; do
       log=$(./wireroute -f "$f" -n "$t" -m W -b 1 -i 5 -p 0.1)
       init=$(echo "$log" | awk -F': ' '/Initialization time/{print $2}')
       comp=$(echo "$log" | awk -F': ' '/Computation time/{print $2}')

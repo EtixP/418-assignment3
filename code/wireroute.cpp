@@ -313,6 +313,9 @@ int main(int argc, char *argv[]) {
     apply_wire(wire, occupancy, 1);
   }
 
+
+  omp_set_dynamic(0);
+  omp_set_num_threads(num_threads);
   // Student code end
   const double init_time =
       std::chrono::duration_cast<std::chrono::duration<double>>(
@@ -329,28 +332,30 @@ int main(int argc, char *argv[]) {
     Use OpenMP to parallelize the algorithm.
   */
   
-  // initialize wires
-  // Within wires
-
-  omp_set_dynamic(0);
-  omp_set_num_threads(num_threads);
-
   if (parallel_mode == 'W') {
     // within wires
-    for(auto &wire:wires){
-      apply_wire(wire, occupancy, -1);
-      int total = count_candidates(wire);
-      Candidate global_best{LLONG_MAX,wire};
+    Wire wire;
+    int total=0;
+    Candidate global_best;
 
-      #pragma omp parallel
-      {
-        Candidate local_best{LLONG_MAX,wire};
-        #pragma omp for schedule(dynamic)
-        for(int cid=0; cid<total; cid++){
+    #pragma omp parallel shared(wires, occupancy, wire, total, global_best)
+    {
+      for (int w = 0; w < (int)wires.size(); w++) {
+        #pragma omp single
+        {
+          wire = wires[w];
+          apply_wire(wire, occupancy, -1);
+          total = count_candidates(wire);
+          global_best = {LLONG_MAX, wire};
+        }
+
+        Candidate local_best{LLONG_MAX, wire};
+        #pragma omp for schedule(static)
+        for (int cid = 0; cid < total; cid++) {
           Wire candi = candidate_from_id(wire, cid);
           long long c = route_add_cost(candi, occupancy);
 
-          if(c<local_best.cost){
+          if (c < local_best.cost) {
             local_best.cost = c;
             local_best.route = candi;
           }
@@ -358,14 +363,18 @@ int main(int argc, char *argv[]) {
 
         #pragma omp critical
         {
-          if(local_best.cost<global_best.cost){
+          if (local_best.cost < global_best.cost) {
             global_best = local_best;
           }
         }
 
+        #pragma omp barrier
+        #pragma omp single
+        {
+          wires[w] = global_best.route;
+          apply_wire(wires[w], occupancy, 1);
+        }
       }
-      wire = global_best.route;
-      apply_wire(wire, occupancy, 1);
     }
     
   } else {
