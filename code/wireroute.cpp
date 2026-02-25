@@ -16,9 +16,12 @@
 #include <string>
 #include <vector>
 #include <climits>
+#include <atomic>
 
 #include <omp.h>
 #include <unistd.h>
+using namespace std;
+
 
 void print_stats(const std::vector<std::vector<int>> &occupancy) {
   int max_occupancy = 0;
@@ -116,7 +119,7 @@ int sgn(int v){
   return (v>0)-(v<0);
 }
 
-int count_candidates(Wire &w){
+int count_candidates(const Wire &w){
   int dx = std::abs(w.end_x-w.start_x);
   int dy = std::abs(w.end_y-w.start_y);
 
@@ -124,7 +127,7 @@ int count_candidates(Wire &w){
   return 2+(dx-1)+(dy-1)+2*(dx-1)*(dy-1);
 }
 
-Wire candidate_from_id(Wire &base, int cid){
+Wire candidate_from_id(const Wire &base, int cid){
   int x0 = base.start_x, y0 = base.start_y;
   int x1 = base.end_x, y1 = base.end_y;
   int dx = std::abs(x1-x0), dy = std::abs(y1-y0);
@@ -223,6 +226,23 @@ long long route_add_cost(const Wire &candi, const std::vector<std::vector<int>> 
     }
   }
   return tot;
+}
+
+Candidate find_best_serial(const Wire &wire, const vector<vector<int>> &occupancy, double SA_prob, mt19937 &seed){
+  int total = count_candidates(wire);
+  uniform_real_distribution<double> rand0to1(0.0,1.0); //Random numb from 0.0 to 1.0
+  if(rand0to1(seed)<SA_prob){
+    uniform_int_distribution<int> pick(0, total - 1); //Pick random possible route
+    Wire w = candidate_from_id(wire, pick(seed));
+    return {route_add_cost(w,occupancy),w};
+  }
+  Candidate best{LLONG_MAX,wire};
+  for(int cid=0; cid<total; cid++){
+    Wire candi = candidate_from_id(wire,cid);
+    long long cost = route_add_cost(candi,occupancy);
+    if(cost<best.cost) best = {cost,candi};
+  }
+  return best;
 }
 
 int main(int argc, char *argv[]) {
@@ -340,7 +360,7 @@ int main(int argc, char *argv[]) {
 
     #pragma omp parallel shared(wires, occupancy, wire, total, global_best)
     {
-      for (int w = 0; w < (int)wires.size(); w++) {
+      for(int w = 0; w < (int)wires.size(); w++) {
         #pragma omp single
         {
           wire = wires[w];
@@ -379,6 +399,47 @@ int main(int argc, char *argv[]) {
     
   } else {
     // across wires
+    for(int SA_i=0; SA_i<SA_iters; SA_i++){
+      int total = (int)wires.size();
+      std::atomic<int> batch_index(0);
+      #pragma omp parallel shared(batch_index, wires, occupancy)
+      {
+        std::mt19937 seed(omp_get_thread_num());
+        std::vector<int> batch_ids;
+        std::vector<Wire> old_wires;
+        std::vector<Wire> new_wires;
+
+        while(true){
+          int start = batch_index.fetch_add(batch_size, std::memory_order_relaxed);
+          if (start>=total) break;
+          int end = std::min(start+batch_size,total);
+
+          batch_ids.clear();
+          old_wires.clear();
+          new_wires.clear();
+          batch_ids.reserve(end - start);
+          old_wires.reserve(end - start);
+          new_wires.reserve(end - start);
+
+          for(int i=start; i<end; i++){
+            Wire old_wire = wires[i];
+            Candidate best = find_best_serial(old_wire, occupancy, SA_prob, seed);
+            batch_ids.push_back(i);
+            old_wires.push_back(old_wire);
+            new_wires.push_back(best.route);
+          }
+
+          #pragma omp critical
+          {
+            for (size_t k = 0; k < batch_ids.size(); k++) {
+              apply_wire(old_wires[k], occupancy, -1);
+              wires[batch_ids[k]] = new_wires[k];
+              apply_wire(wires[batch_ids[k]], occupancy, 1);
+            }
+          }
+        }
+      }
+    }
   }
 
   // Student code end
@@ -401,6 +462,7 @@ int main(int argc, char *argv[]) {
 /* TODO (student): implement to_validate_format to convert Wire to
   validate_wire_t keypoint representation in order to run checker and
   write output
+  
 */
 struct Point {
     int x;
