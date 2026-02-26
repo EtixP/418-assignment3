@@ -1,6 +1,6 @@
 /**
  * Parallel VLSI Wire Routing via OpenMP
- * Name 1(andrew_id 1), Name 2(andrew_id 2)
+ * Jongsun Park (jongsunp), Dylan Sun (bdsun)
  */
 
 #include "wireroute.h"
@@ -49,6 +49,41 @@ struct Candidate{
   Wire route;    
 };
 
+struct IntPoint {
+  int x;
+  int y;
+};
+
+static void add_point_compact(IntPoint pts[], int &n, int x, int y) {
+  if (n > 0 && pts[n-1].x == x && pts[n-1].y == y) return;
+  pts[n++] = {x, y};
+}
+
+static int build_wire_points(const Wire &w, IntPoint pts[5]) {
+  int n = 0;
+  add_point_compact(pts, n, w.start_x, w.start_y);
+  if (w.move_x_start) add_point_compact(pts, n, w.mid_x, w.start_y);
+  else add_point_compact(pts, n, w.start_x, w.mid_y);
+  add_point_compact(pts, n, w.mid_x, w.mid_y);
+  if (w.move_x_end) add_point_compact(pts, n, w.end_x, w.mid_y);
+  else add_point_compact(pts, n, w.mid_x, w.end_y);
+  add_point_compact(pts, n, w.end_x, w.end_y);
+
+  // Remove overlaping points
+  int i = 1;
+  while (i + 1 < n) {
+    bool same_x = (pts[i - 1].x == pts[i].x) && (pts[i].x == pts[i + 1].x);
+    bool same_y = (pts[i - 1].y == pts[i].y) && (pts[i].y == pts[i + 1].y);
+    if (same_x || same_y) {
+      for (int j = i; j + 1 < n; j++) pts[j] = pts[j + 1];
+      n--;
+    } else {
+      i++;
+    }
+  }
+  return n;
+}
+
 void write_output(
     const std::vector<Wire> &wires, const int num_wires,
     const std::vector<std::vector<int>> &occupancy, const int dim_x,
@@ -96,22 +131,23 @@ void write_output(
 
 // Helper function to either subtract or add wire in occupancy
 void apply_wire(const Wire &w, std::vector<std::vector<int>> &occupancy, int change){
-  validate_wire_t vw = w.to_validate_format().cleanup();
+  IntPoint pts[5];
+  int n = build_wire_points(w, pts);
 
-  for(int i=0; i<vw.num_pts-1; i++){
-    int x=vw.p[i].x;
-    int y=vw.p[i].y;
-    int xn=vw.p[i+1].x;
-    int yn=vw.p[i+1].y;
-    int sx=(xn>x)?1:(xn<x?-1:0);
-    int sy=(yn>y)?1:(yn<y?-1:0);
-    
-    while(x!=xn || y!=yn){
+  for (int i = 0; i < n - 1; i++) {
+    int x = pts[i].x;
+    int y = pts[i].y;
+    int xn = pts[i + 1].x;
+    int yn = pts[i + 1].y;
+    int sx = (xn > x) ? 1 : (xn < x ? -1 : 0);
+    int sy = (yn > y) ? 1 : (yn < y ? -1 : 0);
+
+    while (x != xn || y != yn) {
       occupancy[y][x] += change;
-      x+=sx;
-      y+=sy;
+      x += sx;
+      y += sy;
     }
-    if(i==vw.num_pts-2) occupancy[y][x]+=change; //Account for last point
+    if (i == n - 2) occupancy[y][x] += change;
   }
 }
 
@@ -205,26 +241,32 @@ Wire candidate_from_id(const Wire &base, int cid){
 
 }
 
-long long route_add_cost(const Wire &candi, const std::vector<std::vector<int>> &occupancy){
-  validate_wire_t vw = candi.to_validate_format().cleanup();
+static long long incr_cost(int n) {
+  return 2LL*n + 1;  // (n+1)^2 - n^2
+}
+
+long long route_add_cost(const Wire &candi,
+                         const vector<vector<int>> &occupancy) {
   long long tot = 0;
-  for (int i = 0; i < vw.num_pts - 1; ++i) {
-    int x = vw.p[i].x,     y = vw.p[i].y;
-    int xn = vw.p[i + 1].x, yn = vw.p[i + 1].y;
+  IntPoint pts[5];
+  int n = build_wire_points(candi, pts);
+
+  for (int i = 0; i < n - 1; i++) {
+    int x = pts[i].x;
+    int y = pts[i].y;
+    int xn = pts[i + 1].x;
+    int yn = pts[i + 1].y;
     int sx = (xn > x) ? 1 : (xn < x ? -1 : 0);
     int sy = (yn > y) ? 1 : (yn < y ? -1 : 0);
 
     while (x != xn || y != yn) {
-      int n = occupancy[y][x];
-      tot += 2LL * n + 1;            // (n+1)^2 - n^2
+      tot += incr_cost(occupancy[y][x]);
       x += sx;
       y += sy;
     }
-    if (i == vw.num_pts - 2) {  // final endpoint exactly once
-      int n = occupancy[y][x];
-      tot += 2LL * n + 1;
-    }
+    if (i == n - 2) tot += incr_cost(occupancy[y][x]);
   }
+
   return tot;
 }
 
@@ -243,6 +285,37 @@ Candidate find_best_serial(const Wire &wire, const vector<vector<int>> &occupanc
     if(cost<best.cost) best = {cost,candi};
   }
   return best;
+}
+
+
+static void collect_wire_tiles(const Wire &w, int tile_w, int tile_h, int tiles_x,
+                               vector<int>&tile_ids){
+  IntPoint pts[5];
+  int n = build_wire_points(w, pts);
+
+  for (int i = 0; i < n - 1; i++) {
+    int x = pts[i].x;
+    int y = pts[i].y;
+    int xn = pts[i + 1].x;
+    int yn = pts[i + 1].y;
+
+    // Each segment is axis-aligned collect touched tiles by tile range
+    int min_x = (x < xn) ? x : xn;
+    int max_x = (x > xn) ? x : xn;
+    int min_y = (y < yn) ? y : yn;
+    int max_y = (y > yn) ? y : yn;
+
+    int tx0 = min_x / tile_w;
+    int tx1 = max_x / tile_w;
+    int ty0 = min_y / tile_h;
+    int ty1 = max_y / tile_h;
+
+    for (int ty = ty0; ty <= ty1; ty++) {
+      for (int tx = tx0; tx <= tx1; tx++) {
+        tile_ids.push_back(ty * tiles_x + tx);
+      }
+    }
+  }
 }
 
 int main(int argc, char *argv[]) {
@@ -354,72 +427,100 @@ int main(int argc, char *argv[]) {
   
   if (parallel_mode == 'W') {
     // within wires
-    Wire wire;
-    int total=0;
-    Candidate global_best;
+    for (int SA_i = 0; SA_i < SA_iters; SA_i++) {
+      Wire wire;
+      int total=0;
+      Candidate global_best;
+      bool choose_random = false;
+      mt19937 sa_seed(418 + SA_i);
 
-    #pragma omp parallel shared(wires, occupancy, wire, total, global_best)
-    {
-      for(int w = 0; w < (int)wires.size(); w++) {
-        #pragma omp single
-        {
-          wire = wires[w];
-          apply_wire(wire, occupancy, -1);
-          total = count_candidates(wire);
-          global_best = {LLONG_MAX, wire};
-        }
+      #pragma omp parallel shared(wires, occupancy, wire, total, global_best, choose_random, sa_seed)
+      {
+        for(int w = 0; w < (int)wires.size(); w++) {
+          #pragma omp single
+          {
+            wire = wires[w];
+            apply_wire(wire, occupancy, -1);
+            total = count_candidates(wire);
+            global_best = {LLONG_MAX, wire};
 
-        Candidate local_best{LLONG_MAX, wire};
-        #pragma omp for schedule(static)
-        for (int cid = 0; cid < total; cid++) {
-          Wire candi = candidate_from_id(wire, cid);
-          long long c = route_add_cost(candi, occupancy);
-
-          if (c < local_best.cost) {
-            local_best.cost = c;
-            local_best.route = candi;
+            uniform_real_distribution<double> rand0to1(0.0, 1.0);
+            choose_random = (rand0to1(sa_seed) < SA_prob);
+            if (choose_random) {
+              uniform_int_distribution<int> pick(0, total - 1);
+              Wire random_route = candidate_from_id(wire, pick(sa_seed));
+              global_best = {0, random_route};
+            }
           }
-        }
 
-        #pragma omp critical
-        {
-          if (local_best.cost < global_best.cost) {
-            global_best = local_best;
+          Candidate local_best{LLONG_MAX, wire};
+          if (!choose_random) {
+            #pragma omp for schedule(static)
+            for (int cid = 0; cid < total; cid++) {
+              Wire candi = candidate_from_id(wire, cid);
+              long long c = route_add_cost(candi, occupancy);
+
+              if (c < local_best.cost) {
+                local_best.cost = c;
+                local_best.route = candi;
+              }
+            }
           }
-        }
 
-        #pragma omp barrier
-        #pragma omp single
-        {
-          wires[w] = global_best.route;
-          apply_wire(wires[w], occupancy, 1);
+          if (!choose_random) {
+            #pragma omp critical
+            {
+              if (local_best.cost < global_best.cost) {
+                global_best = local_best;
+              }
+            }
+          }
+
+          #pragma omp barrier
+          #pragma omp single
+          {
+            wires[w] = global_best.route;
+            apply_wire(wires[w], occupancy, 1);
+          }
         }
       }
     }
     
   } else {
     // across wires
+    const int tile_w = 8; //tile width
+    const int tile_h = 8; //tile height
+    const int tiles_x = (dim_x + tile_w - 1) / tile_w; //# of tiles in a row
+    const int tiles_y = (dim_y + tile_h - 1) / tile_h; //# of tiles in a col
+    const int num_tile_locks = tiles_x * tiles_y;
+
+    vector<omp_lock_t> tile_locks(num_tile_locks);
+    for (int i = 0; i < num_tile_locks; i++) {
+      omp_init_lock(&tile_locks[i]);
+    }
+
     for(int SA_i=0; SA_i<SA_iters; SA_i++){
       int total = (int)wires.size();
       std::atomic<int> batch_index(0);
       #pragma omp parallel shared(batch_index, wires, occupancy)
       {
-        std::mt19937 seed(omp_get_thread_num());
-        std::vector<int> batch_ids;
-        std::vector<Wire> old_wires;
-        std::vector<Wire> new_wires;
+        mt19937 seed(omp_get_thread_num());
+        vector<int> batch_ids;
+        vector<Wire> old_wires;
+        vector<Wire> new_wires;
+        vector<int> touched_tiles;
 
         while(true){
-          int start = batch_index.fetch_add(batch_size, std::memory_order_relaxed);
+          int start = batch_index.fetch_add(batch_size, memory_order_relaxed);
           if (start>=total) break;
-          int end = std::min(start+batch_size,total);
+          int end = min(start+batch_size,total);
 
-          batch_ids.clear();
+          batch_ids.clear(); //No need to realloc
           old_wires.clear();
           new_wires.clear();
           batch_ids.reserve(end - start);
-          old_wires.reserve(end - start);
-          new_wires.reserve(end - start);
+          old_wires.reserve(end - start); //Store old routes
+          new_wires.reserve(end - start); //Store new routes
 
           for(int i=start; i<end; i++){
             Wire old_wire = wires[i];
@@ -429,16 +530,33 @@ int main(int argc, char *argv[]) {
             new_wires.push_back(best.route);
           }
 
-          #pragma omp critical
-          {
-            for (size_t k = 0; k < batch_ids.size(); k++) {
-              apply_wire(old_wires[k], occupancy, -1);
-              wires[batch_ids[k]] = new_wires[k];
-              apply_wire(wires[batch_ids[k]], occupancy, 1);
+          for(size_t k = 0; k<batch_ids.size(); k++){
+            touched_tiles.clear();
+            collect_wire_tiles(old_wires[k], tile_w, tile_h, tiles_x, touched_tiles);
+            collect_wire_tiles(new_wires[k], tile_w, tile_h, tiles_x, touched_tiles);
+            sort(touched_tiles.begin(), touched_tiles.end());
+            touched_tiles.erase(unique(touched_tiles.begin(), touched_tiles.end()),
+                                touched_tiles.end()); // Erase Duplicates
+
+            //Lock all tiles that are touched by old/new routes
+            for (int tile_id : touched_tiles) { 
+              omp_set_lock(&tile_locks[tile_id]);
+            }
+
+            apply_wire(old_wires[k], occupancy, -1);
+            wires[batch_ids[k]] = new_wires[k];
+            apply_wire(wires[batch_ids[k]], occupancy, 1);
+
+            for (int ti = (int)touched_tiles.size() - 1; ti >= 0; ti--) {
+              omp_unset_lock(&tile_locks[touched_tiles[ti]]);
             }
           }
         }
       }
+    }
+
+    for (int i = 0; i < num_tile_locks; i++) {
+      omp_destroy_lock(&tile_locks[i]);
     }
   }
 
