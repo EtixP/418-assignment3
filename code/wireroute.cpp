@@ -245,28 +245,98 @@ static long long incr_cost(int n) {
   return 2LL*n + 1;  // (n+1)^2 - n^2
 }
 
+static void add_segment_cost(const vector<vector<int>> &occupancy,
+                             int x0, int y0, int x1, int y1,
+                             long long &tot) {
+  if (x0 == x1 && y0 == y1) return;
+
+  if (y0 == y1) {
+    int x = x0;
+    int sx = (x1 > x0) ? 1 : -1;
+    while (x != x1) {
+      int n = occupancy[y0][x];
+      tot += 2LL*n + 1;
+      x += sx;
+    }
+  } else {
+    int y = y0;
+    int sy = (y1 > y0) ? 1 : -1;
+    while (y != y1) {
+      int n = occupancy[y][x0];
+      tot += 2LL*n + 1;
+      y += sy;
+    }
+  }
+}
+
+static bool add_segment_cost_bounded(const vector<vector<int>> &occupancy,
+                                     int x0, int y0, int x1, int y1,
+                                     long long &tot, long long bound) {
+  if (x0 == x1 && y0 == y1) return false;
+
+  if (y0 == y1) {
+    int x = x0;
+    int sx = (x1 > x0) ? 1 : -1;
+    while (x != x1) {
+      int n = occupancy[y0][x];
+      tot += 2LL*n + 1;
+      if (tot >= bound) return true;
+      x += sx;
+    }
+  } else {
+    int y = y0;
+    int sy = (y1 > y0) ? 1 : -1;
+    while (y != y1) {
+      int n = occupancy[y][x0];
+      tot += 2LL*n + 1;
+      if (tot >= bound) return true;
+      y += sy;
+    }
+  }
+
+  return false;
+}
+
 long long route_add_cost(const Wire &candi,
                          const vector<vector<int>> &occupancy) {
   long long tot = 0;
-  IntPoint pts[5];
-  int n = build_wire_points(candi, pts);
 
-  for (int i = 0; i < n - 1; i++) {
-    int x = pts[i].x;
-    int y = pts[i].y;
-    int xn = pts[i + 1].x;
-    int yn = pts[i + 1].y;
-    int sx = (xn > x) ? 1 : (xn < x ? -1 : 0);
-    int sy = (yn > y) ? 1 : (yn < y ? -1 : 0);
+  int p0x = candi.start_x, p0y = candi.start_y;
+  int p1x = candi.move_x_start ? candi.mid_x : candi.start_x;
+  int p1y = candi.move_x_start ? candi.start_y : candi.mid_y;
+  int p2x = candi.mid_x, p2y = candi.mid_y;
+  int p3x = candi.move_x_end ? candi.end_x : candi.mid_x;
+  int p3y = candi.move_x_end ? candi.mid_y : candi.end_y;
+  int p4x = candi.end_x, p4y = candi.end_y;
 
-    while (x != xn || y != yn) {
-      tot += incr_cost(occupancy[y][x]);
-      x += sx;
-      y += sy;
-    }
-    if (i == n - 2) tot += incr_cost(occupancy[y][x]);
-  }
+  add_segment_cost(occupancy, p0x, p0y, p1x, p1y, tot);
+  add_segment_cost(occupancy, p1x, p1y, p2x, p2y, tot);
+  add_segment_cost(occupancy, p2x, p2y, p3x, p3y, tot);
+  add_segment_cost(occupancy, p3x, p3y, p4x, p4y, tot);
 
+  tot += incr_cost(occupancy[p4y][p4x]);
+  return tot;
+}
+
+long long route_add_cost_bounded(const Wire &candi,
+                                 const vector<vector<int>> &occupancy,
+                                 long long bound) {
+  long long tot = 0;
+
+  int p0x = candi.start_x, p0y = candi.start_y;
+  int p1x = candi.move_x_start ? candi.mid_x : candi.start_x;
+  int p1y = candi.move_x_start ? candi.start_y : candi.mid_y;
+  int p2x = candi.mid_x, p2y = candi.mid_y;
+  int p3x = candi.move_x_end ? candi.end_x : candi.mid_x;
+  int p3y = candi.move_x_end ? candi.mid_y : candi.end_y;
+  int p4x = candi.end_x, p4y = candi.end_y;
+
+  if (add_segment_cost_bounded(occupancy, p0x, p0y, p1x, p1y, tot, bound)) return tot;
+  if (add_segment_cost_bounded(occupancy, p1x, p1y, p2x, p2y, tot, bound)) return tot;
+  if (add_segment_cost_bounded(occupancy, p2x, p2y, p3x, p3y, tot, bound)) return tot;
+  if (add_segment_cost_bounded(occupancy, p3x, p3y, p4x, p4y, tot, bound)) return tot;
+
+  tot += incr_cost(occupancy[p4y][p4x]);
   return tot;
 }
 
@@ -278,10 +348,21 @@ Candidate find_best_serial(const Wire &wire, const vector<vector<int>> &occupanc
     Wire w = candidate_from_id(wire, pick(seed));
     return {route_add_cost(w,occupancy),w};
   }
-  Candidate best{LLONG_MAX,wire};
+
+  long long current_cost = route_add_cost(wire, occupancy);
+  Candidate best{current_cost,wire};
+
+  int probe_n = (total < 24) ? total : 24;
+  for (int p = 0; p < probe_n; p++) {
+    int cid = (probe_n == 1) ? 0 : (p * (total - 1)) / (probe_n - 1);
+    Wire candi = candidate_from_id(wire, cid);
+    long long cost = route_add_cost_bounded(candi, occupancy, best.cost);
+    if(cost<best.cost) best = {cost,candi};
+  }
+
   for(int cid=0; cid<total; cid++){
     Wire candi = candidate_from_id(wire,cid);
-    long long cost = route_add_cost(candi,occupancy);
+    long long cost = route_add_cost_bounded(candi, occupancy, best.cost);
     if(cost<best.cost) best = {cost,candi};
   }
   return best;
@@ -432,9 +513,11 @@ int main(int argc, char *argv[]) {
       int total=0;
       Candidate global_best;
       bool choose_random = false;
-      mt19937 sa_seed(418 + SA_i);
+      long long current_cost = 0;
+      mt19937 sa_seed(SA_i);
+      atomic<long long> best_bound(LLONG_MAX);
 
-      #pragma omp parallel shared(wires, occupancy, wire, total, global_best, choose_random, sa_seed)
+      #pragma omp parallel shared(wires, occupancy, wire, total, global_best, choose_random, current_cost, sa_seed, best_bound)
       {
         for(int w = 0; w < (int)wires.size(); w++) {
           #pragma omp single
@@ -442,27 +525,52 @@ int main(int argc, char *argv[]) {
             wire = wires[w];
             apply_wire(wire, occupancy, -1);
             total = count_candidates(wire);
-            global_best = {LLONG_MAX, wire};
 
             uniform_real_distribution<double> rand0to1(0.0, 1.0);
             choose_random = (rand0to1(sa_seed) < SA_prob);
             if (choose_random) {
               uniform_int_distribution<int> pick(0, total - 1);
               Wire random_route = candidate_from_id(wire, pick(sa_seed));
-              global_best = {0, random_route};
+              global_best = {route_add_cost(random_route, occupancy), random_route};
+            } else {
+              current_cost = route_add_cost(wire, occupancy);
+              global_best = {current_cost, wire};
+
+              int probe_n = (total < 24) ? total : 24;
+              for (int p = 0; p < probe_n; p++) {
+                int cid = (probe_n == 1) ? 0 : (p * (total - 1)) / (probe_n - 1);
+                Wire probe = candidate_from_id(wire, cid);
+                long long probe_cost = route_add_cost_bounded(probe, occupancy, global_best.cost);
+                if (probe_cost < global_best.cost) {
+                  global_best = {probe_cost, probe};
+                }
+              }
+
+              current_cost = global_best.cost;
+              best_bound.store(current_cost, memory_order_relaxed);
             }
           }
 
-          Candidate local_best{LLONG_MAX, wire};
+          Candidate local_best{current_cost, wire};
           if (!choose_random) {
             #pragma omp for schedule(static)
             for (int cid = 0; cid < total; cid++) {
               Wire candi = candidate_from_id(wire, cid);
-              long long c = route_add_cost(candi, occupancy);
+
+              long long bound = local_best.cost;
+              long long gbound = best_bound.load(memory_order_relaxed);
+              if (gbound < bound) bound = gbound;
+
+              long long c = route_add_cost_bounded(candi, occupancy, bound);
 
               if (c < local_best.cost) {
                 local_best.cost = c;
                 local_best.route = candi;
+
+                long long old_bound = best_bound.load(memory_order_relaxed);
+                while (c < old_bound &&
+                       !best_bound.compare_exchange_weak(old_bound, c, memory_order_relaxed)) {
+                }
               }
             }
           }
@@ -485,7 +593,7 @@ int main(int argc, char *argv[]) {
         }
       }
     }
-    
+
   } else {
     // across wires
     const int tile_w = 8; //tile width
