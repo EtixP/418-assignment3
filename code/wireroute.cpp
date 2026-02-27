@@ -33,8 +33,15 @@ struct Point {
 
 // representation of a given route of a wire path
 struct Route {
+  struct Seg {
+    int x0, y0, x1, y1;
+    int sx, sy;
+  };
   uint8_t num_pts;
   Point pts[5];
+  Wire wire_repr;
+  uint8_t num_segs;
+  Seg segs[4];
 };
 
 // struct for selecting best candidate in within_wire parallel
@@ -193,6 +200,16 @@ static inline Route route_from_wire(const Wire &w) {
   int n = build_wire_points(w, pts);
   r.num_pts = static_cast<uint8_t>(n);
   for (int i = 0; i < n; ++i) r.pts[i] = pts[i];
+  r.wire_repr = w;
+  r.num_segs = static_cast<uint8_t>(n > 0 ? n - 1 : 0);
+  for (int i = 0; i + 1 < n; ++i) {
+    r.segs[i].x0 = r.pts[i].x;
+    r.segs[i].y0 = r.pts[i].y;
+    r.segs[i].x1 = r.pts[i + 1].x;
+    r.segs[i].y1 = r.pts[i + 1].y;
+    r.segs[i].sx = sign_step(r.segs[i].x1 - r.segs[i].x0);
+    r.segs[i].sy = sign_step(r.segs[i].y1 - r.segs[i].y0);
+  }
   return r;
 }
 
@@ -323,25 +340,27 @@ long long eval_cost(const std::vector<std::vector<int>> &occupancy,
 
   long long total = 0;
 
-  for (int seg = 0; seg + 1 < route.num_pts; ++seg) {
-    int x0 = route.pts[seg].x;
-    int y0 = route.pts[seg].y;
-    int x1 = route.pts[seg + 1].x;
-    int y1 = route.pts[seg + 1].y;
+  for (int seg = 0; seg < route.num_segs; ++seg) {
+    const Route::Seg &s = route.segs[seg];
+    int x = s.x0;
+    int y = s.y0;
 
-    int sx = sign_dir(x1 - x0);
-    int sy = sign_dir(y1 - y0);
-
-    int x = x0, y = y0;
-    while (x != x1 || y != y1) {
-      total += incremental_add_cost(occupancy[y][x]);
-      x += sx;
-      y += sy;
+    if (s.sx != 0) {
+      const int *row = occupancy[y].data();
+      while (x != s.x1) {
+        total += 2LL * row[x] + 1LL;
+        x += s.sx;
+      }
+    } else {
+      while (y != s.y1) {
+        total += 2LL * occupancy[y][x] + 1LL;
+        y += s.sy;
+      }
     }
 
-    // Include final endpoint only for last segment.
-    if (seg + 2 == route.num_pts) {
-      total += incremental_add_cost(occupancy[y][x]);
+    // Include final endpoint only for the last segment.
+    if (seg + 1 == route.num_segs) {
+      total += 2LL * occupancy[y][x] + 1LL;
     }
   }
 
@@ -442,12 +461,6 @@ int main(int argc, char *argv[]) {
 
   /* Initialize any additional data structures needed in the algorithm */
 
-  /*
-    TODO (student code start): Implement the wire routing algorithm here and
-    feel free to structure the algorithm into different functions.
-    Don't use global variables.
-    Use OpenMP to parallelize the algorithm.
-  */
   std::mt19937 rng(std::random_device{}()); // seeding for a random number for probablistic on SA_prob
 
   for(Wire &wire: wires){
@@ -469,6 +482,18 @@ int main(int argc, char *argv[]) {
   for (size_t w = 0; w < (size_t) num_wires; ++w) {
     wire_routes[w] = generate_candidates(wires, w);
   }
+  const double gen_time =
+    std::chrono::duration_cast<std::chrono::duration<double>>(
+        std::chrono::steady_clock::now() - compute_start)
+        .count();
+  std::cout << "Generation time (sec): " << gen_time << '\n';
+
+    /*
+    TODO (student code start): Implement the wire routing algorithm here and
+    feel free to structure the algorithm into different functions.
+    Don't use global variables.
+    Use OpenMP to parallelize the algorithm.
+  */
 
 
   if (parallel_mode == 'W') {
@@ -477,6 +502,10 @@ int main(int argc, char *argv[]) {
     // thread-wise shared data
     std::vector<long long> thread_best_cost(num_threads, LLONG_MAX);
     std::vector<size_t> thread_best_idx(num_threads, 0);
+    double t_random_update = 0.0;
+    double t_candidate_eval = 0.0;
+    double t_commit_merge_apply = 0.0;
+    double eval_phase_start = 0.0;
 
     bool skip_wire = false;
     bool do_random = false;
@@ -485,6 +514,7 @@ int main(int argc, char *argv[]) {
     #pragma omp parallel num_threads(num_threads) shared(wires, occupancy, wire_routes, rng, SA_prob, SA_iters, num_wires, thread_best_cost, thread_best_idx, skip_wire, do_random, random_index)
     {
       int tid = omp_get_thread_num();
+
       for (size_t iter = 0; iter < (size_t) SA_iters; ++iter) {
         for (size_t wire_index = 0; wire_index < (size_t) num_wires; ++wire_index) {
           // serial decisions/state mutation for this wire
@@ -500,12 +530,14 @@ int main(int argc, char *argv[]) {
             }
             // ! if P is hit choose a route randomly from the set of all candidates
             else if (std::bernoulli_distribution(SA_prob)(rng)) {
+              const double random_start = omp_get_wtime();
               do_random = true;
               random_index =
                 std::uniform_int_distribution<size_t>(0, wire_routes[wire_index].size() - 1)(rng);
               apply_wire(wires[wire_index], occupancy, -1);
-              wire_from_route(wires[wire_index], wire_routes[wire_index][random_index]);
+              wires[wire_index] = wire_routes[wire_index][random_index].wire_repr;
               apply_wire(wires[wire_index], occupancy, +1);
+              t_random_update += (omp_get_wtime() - random_start);
             }
             else{
               // ! non-random path: remove old route once before candidate eval
@@ -513,13 +545,23 @@ int main(int argc, char *argv[]) {
             }
           }
 
-          if (skip_wire || do_random) {
+          bool skip_local = skip_wire;
+          bool random_local = do_random;
+
+          #pragma omp barrier // ensures all threads captured same decision
+          
+          if (skip_local || random_local) {
             continue;
           }
 
           // local best for current thread
           long long local_best{LLONG_MAX};
           size_t local_best_index = 0;
+
+          #pragma omp single
+          {
+            eval_phase_start = omp_get_wtime();
+          }
 
           // parallelize the next for loop via static assignment
           #pragma omp for schedule(static)
@@ -533,15 +575,22 @@ int main(int argc, char *argv[]) {
             }
           }
 
+          #pragma omp single
+          {
+            t_candidate_eval += (omp_get_wtime() - eval_phase_start);
+          }
+
           // publish per-thread result
           thread_best_cost[tid] = local_best;
           thread_best_idx[tid] = local_best_index;
-          
-          //#pragma omp barrier
+
+          // Ensure all thread_best_* writes are visible before merge.
+          #pragma omp barrier
           
           // serial merge + commit chosen route
           #pragma omp single
           {
+            const double commit_start = omp_get_wtime();
             long long global_best = LLONG_MAX;
             size_t best_index = 0;
 
@@ -552,13 +601,17 @@ int main(int argc, char *argv[]) {
               }
             }
             // ! update wire formation and occupancy matrix
-            wire_from_route(wires[wire_index], wire_routes[wire_index][best_index]);
+            wires[wire_index] = wire_routes[wire_index][best_index].wire_repr;
             apply_wire(wires[wire_index], occupancy, +1);
+            t_commit_merge_apply += (omp_get_wtime() - commit_start);
           }
-          //#pragma omp barrier
         }
       }
     }
+
+    std::cout << "Profile random_update (sec): " << t_random_update << '\n';
+    std::cout << "Profile candidate_eval (sec): " << t_candidate_eval << '\n';
+    std::cout << "Profile commit_merge_apply (sec): " << t_commit_merge_apply << '\n';
   }
   else {
     // across wires
