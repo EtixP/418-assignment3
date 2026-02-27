@@ -1,6 +1,6 @@
 /**
  * Parallel VLSI Wire Routing via OpenMP
- * Jongsun Park (jongsunp), Dylan Sun (bdsun)
+ * Name 1(andrew_id 1), Name 2(andrew_id 2)
  */
 
 #include "wireroute.h"
@@ -16,12 +16,32 @@
 #include <string>
 #include <vector>
 #include <climits>
-#include <atomic>
+
 
 #include <omp.h>
 #include <unistd.h>
-using namespace std;
 
+struct Candidate{
+  long long cost;
+  Wire route;    
+};
+
+struct Point {
+    int x;
+    int y;
+};
+
+// representation of a given route of a wire path
+struct Route {
+  uint8_t num_pts;
+  Point pts[5];
+};
+
+// struct for selecting best candidate in within_wire parallel
+struct BestRoute_local {
+  long long cost;
+  int cid;
+};
 
 void print_stats(const std::vector<std::vector<int>> &occupancy) {
   int max_occupancy = 0;
@@ -43,47 +63,6 @@ void print_stats(const std::vector<std::vector<int>> &occupancy) {
 (2) It convert wires from Wire to validate_wire_t by to_validate_format
 (2) It write wires into another file
 */
-
-struct Candidate{
-  long long cost;
-  Wire route;    
-};
-
-struct IntPoint {
-  int x;
-  int y;
-};
-
-static void add_point_compact(IntPoint pts[], int &n, int x, int y) {
-  if (n > 0 && pts[n-1].x == x && pts[n-1].y == y) return;
-  pts[n++] = {x, y};
-}
-
-static int build_wire_points(const Wire &w, IntPoint pts[5]) {
-  int n = 0;
-  add_point_compact(pts, n, w.start_x, w.start_y);
-  if (w.move_x_start) add_point_compact(pts, n, w.mid_x, w.start_y);
-  else add_point_compact(pts, n, w.start_x, w.mid_y);
-  add_point_compact(pts, n, w.mid_x, w.mid_y);
-  if (w.move_x_end) add_point_compact(pts, n, w.end_x, w.mid_y);
-  else add_point_compact(pts, n, w.mid_x, w.end_y);
-  add_point_compact(pts, n, w.end_x, w.end_y);
-
-  // Remove overlaping points
-  int i = 1;
-  while (i + 1 < n) {
-    bool same_x = (pts[i - 1].x == pts[i].x) && (pts[i].x == pts[i + 1].x);
-    bool same_y = (pts[i - 1].y == pts[i].y) && (pts[i].y == pts[i + 1].y);
-    if (same_x || same_y) {
-      for (int j = i; j + 1 < n; j++) pts[j] = pts[j + 1];
-      n--;
-    } else {
-      i++;
-    }
-  }
-  return n;
-}
-
 void write_output(
     const std::vector<Wire> &wires, const int num_wires,
     const std::vector<std::vector<int>> &occupancy, const int dim_x,
@@ -129,194 +108,248 @@ void write_output(
   out_wires.close();
 }
 
-// Helper function to either subtract or add wire in occupancy
-void apply_wire(const Wire &w, std::vector<std::vector<int>> &occupancy, int change){
-  IntPoint pts[5];
-  int n = build_wire_points(w, pts);
+// ! helper to initialize all necessary components before stepping into T = 1
+void initialize() {}
 
-  for (int i = 0; i < n - 1; i++) {
-    int x = pts[i].x;
-    int y = pts[i].y;
-    int xn = pts[i + 1].x;
-    int yn = pts[i + 1].y;
-    int sx = (xn > x) ? 1 : (xn < x ? -1 : 0);
-    int sy = (yn > y) ? 1 : (yn < y ? -1 : 0);
+static void add_point_compact(Point pts[], int &n, int x, int y) {
+  if (n > 0 && pts[n-1].x == x && pts[n-1].y == y) return;
+  pts[n++] = {x, y};
+}
 
-    while (x != xn || y != yn) {
-      occupancy[y][x] += change;
-      x += sx;
-      y += sy;
+static int build_wire_points(const Wire &w, Point pts[5]) {
+  int n = 0;
+  add_point_compact(pts, n, w.start_x, w.start_y);
+  if (w.move_x_start) add_point_compact(pts, n, w.mid_x, w.start_y);
+  else add_point_compact(pts, n, w.start_x, w.mid_y);
+  add_point_compact(pts, n, w.mid_x, w.mid_y);
+  if (w.move_x_end) add_point_compact(pts, n, w.end_x, w.mid_y);
+  else add_point_compact(pts, n, w.mid_x, w.end_y);
+  add_point_compact(pts, n, w.end_x, w.end_y);
+
+  // Remove overlaping points
+  int i = 1;
+  while (i + 1 < n) {
+    bool same_x = (pts[i - 1].x == pts[i].x) && (pts[i].x == pts[i + 1].x);
+    bool same_y = (pts[i - 1].y == pts[i].y) && (pts[i].y == pts[i + 1].y);
+    if (same_x || same_y) {
+      for (int j = i; j + 1 < n; j++) pts[j] = pts[j + 1];
+      n--;
+    } else {
+      i++;
     }
-    if (i == n - 2) occupancy[y][x] += change;
+  }
+  return n;
+}
+
+static inline int sign_step(int v) {
+  return (v > 0) - (v < 0);
+}
+
+static inline void apply_segment(int x0, int y0, int x1, int y1,
+                                 std::vector<std::vector<int>> &occupancy,
+                                 int delta, bool include_endpoint) {
+  int x = x0;
+  int y = y0;
+  int sx = sign_step(x1 - x0);
+  int sy = sign_step(y1 - y0);
+
+  // Walk from start to end (excluding end by default).
+  while (x != x1 || y != y1) {
+    occupancy[y][x] += delta;
+    x += sx;
+    y += sy;
+  }
+
+  // Include final endpoint once for the last segment only.
+  if (include_endpoint) {
+    occupancy[y][x] += delta;
   }
 }
 
-int sgn(int v){
-  return (v>0)-(v<0);
+void apply_wire(const Wire &w, std::vector<std::vector<int>> &occupancy, int delta) {
+  Point pts[5];
+  int n = build_wire_points(w, pts);
+
+  for (int i = 0; i + 1 < n; ++i) {
+    bool include_endpoint = (i + 2 == n); // only last segment includes its end
+    apply_segment(pts[i].x, pts[i].y,
+                  pts[i + 1].x, pts[i + 1].y,
+                  occupancy, delta, include_endpoint);
+  }
 }
 
-int count_candidates(const Wire &w){
-  int dx = std::abs(w.end_x-w.start_x);
-  int dy = std::abs(w.end_y-w.start_y);
 
-  if(dx==0||dy==0) return 1;
-  return 2+(dx-1)+(dy-1)+2*(dx-1)*(dy-1);
+// ! helper for greedy search of each wire's best route
+void routing(Wire w) {}
+
+static inline int sign_dir(int v) {
+  return (v > 0) - (v < 0);
 }
 
-Wire candidate_from_id(const Wire &base, int cid){
-  int x0 = base.start_x, y0 = base.start_y;
-  int x1 = base.end_x, y1 = base.end_y;
-  int dx = std::abs(x1-x0), dy = std::abs(y1-y0);
-  int sx = sgn(x1-x0), sy = sgn(y1-y0);
+// output the current Route 
+static inline Route route_from_wire(const Wire &w) {
+  Route r{};
+  Point pts[5];
+  int n = build_wire_points(w, pts);
+  r.num_pts = static_cast<uint8_t>(n);
+  for (int i = 0; i < n; ++i) r.pts[i] = pts[i];
+  return r;
+}
 
-  Wire w = base;
+static inline void push_candidate_route(std::vector<Route> &out,
+                                        const Wire &base,
+                                        bool move_x_start,
+                                        bool move_x_end,
+                                        int mid_x,
+                                        int mid_y) {
+  Wire c = base;
+  c.move_x_start = move_x_start;
+  c.move_x_end = move_x_end;
+  c.mid_x = mid_x;
+  c.mid_y = mid_y;
+  out.push_back(route_from_wire(c));
+}
 
-  //Straight line
+// generate a set of all possible routes for a given wires[wire_index]
+std::vector<Route> generate_candidates(const std::vector<Wire> &wires, size_t wire_index) {
+  std::vector<Route> out;
+  if (wire_index >= wires.size()) return out;
+
+  const Wire &base = wires[wire_index];
+  const int x0 = base.start_x, y0 = base.start_y;
+  const int x1 = base.end_x,   y1 = base.end_y;
+
+  const int dx = std::abs(x1 - x0);
+  const int dy = std::abs(y1 - y0);
+  const int sx = sign_dir(x1 - x0);
+  const int sy = sign_dir(y1 - y0);
+
+  // Straight line: only one legal route.
   if (dx == 0 || dy == 0) {
-    w.move_x_start = true;
-    w.move_x_end = false;
-    w.mid_x = x1;
-    w.mid_y = y0;
-    return w;
+    push_candidate_route(out, base, true, false, x1, y0);
+    return out;
   }
 
-  //1 bend
-  if(cid == 0) { // horizontal first
-    w.move_x_start = true;
-    w.move_x_end = false;
-    w.mid_x = x1;
-    w.mid_y = y0;
-    return w;
+  // total = dx + dy + 2*(dx-1)*(dy-1)
+  out.reserve(dx + dy + 2 * (dx - 1) * (dy - 1));
+
+  // 1-bend
+  push_candidate_route(out, base, true,  false, x1, y0); // horizontal-first
+  push_candidate_route(out, base, false, true,  x0, y1); // vertical-first
+
+  // 2-bend (HF family)
+  for (int k = 1; k <= dx - 1; ++k) {
+    int xm = x0 + sx * k;
+    push_candidate_route(out, base, true, true, xm, y1);
   }
-  if(cid == 1) { // vertical first
-    w.move_x_start = false;
-    w.move_x_end = true;
-    w.mid_x = x0;
-    w.mid_y = y1;
-    return w;
+
+  // 2-bend (VF family)
+  for (int l = 1; l <= dy - 1; ++l) {
+    int ym = y0 + sy * l;
+    push_candidate_route(out, base, false, false, x1, ym);
   }
-  cid -= 2;
 
-  //2 bend
-  if(cid<dx-1){ 
-    int xm = x0+sx*(cid+1);
-    w.move_x_start = true;
-    w.move_x_end = true;
-    w.mid_x = xm;
-    w.mid_y = y1;
-    return w;
+  // 3-bend: two orientations per interior point
+  for (int l = 1; l <= dy - 1; ++l) {
+    int ym = y0 + sy * l;
+    for (int k = 1; k <= dx - 1; ++k) {
+      int xm = x0 + sx * k;
+      push_candidate_route(out, base, true,  true,  xm, ym); // HF overall
+      push_candidate_route(out, base, false, false, xm, ym); // VF overall
+    }
   }
-  cid -= (dx-1);
 
-  if(cid < dy - 1) {
-    int ym = y0 + sy * (cid + 1); // interior y
-    w.move_x_start = false;
-    w.move_x_end = false;
-    w.mid_x = x1;
-    w.mid_y = ym;
-    return w;
-  }
-  cid -= (dy-1);
-
-  //3 bend
-  int interior = (dx - 1)*(dy - 1);
-  int orient = cid / interior;      // 0: HF, 1: VF
-  int idx = cid % interior;
-
-  int k = idx % (dx - 1) + 1;       // x interior index
-  int l = idx / (dx - 1) + 1;       // y interior index
-  int xm = x0 + sx * k;
-  int ym = y0 + sy * l;
-
-  w.mid_x = xm;
-  w.mid_y = ym;
-  if (orient == 0) {                 // Horizontal: x->y then x->y
-    w.move_x_start = true;
-    w.move_x_end = true;
-  } else {                           // Vertical: y->x then y->x
-    w.move_x_start = false;
-    w.move_x_end = false;
-  }
-  return w;
-
+  return out;
 }
 
-static long long incr_cost(int n) {
-  return 2LL*n + 1;  // (n+1)^2 - n^2
+// convert a given Route object and rewrite the input Wire object
+static inline void wire_from_route(Wire &wire, const Route &route) {
+  const int first = 0;
+  const int last = static_cast<int>(route.num_pts) - 1;
+
+  wire.start_x = route.pts[first].x;
+  wire.start_y = route.pts[first].y;
+  wire.end_x   = route.pts[last].x;
+  wire.end_y   = route.pts[last].y;
+
+  const Point &start_point = route.pts[first];
+  const Point &second_point = route.pts[first + 1];
+  const Point &before_end_point = route.pts[last - 1];
+  const Point &end_point = route.pts[last];
+
+  // True if first segment is horizontal.
+  wire.move_x_start = (second_point.y == start_point.y);
+
+  // True if last segment is horizontal.
+  wire.move_x_end = (before_end_point.y == end_point.y);
+
+  if (route.num_pts == 2) {
+    // Straight line canonical form.
+    wire.mid_x = wire.end_x;
+    wire.mid_y = wire.start_y;
+    wire.move_x_start = true;
+    wire.move_x_end = false;
+    return;
+  }
+
+  if (route.num_pts == 3) {
+    wire.mid_x = route.pts[1].x;
+    wire.mid_y = route.pts[1].y;
+    return;
+  }
+
+  if (route.num_pts == 4) {
+    wire.mid_x = route.pts[2].x;
+    wire.mid_y = route.pts[2].y;
+    return;
+  }
+
+  // route.num_pts == 5
+  wire.mid_x = route.pts[2].x;
+  wire.mid_y = route.pts[2].y;
 }
 
-long long route_add_cost(const Wire &candi,
-                         const vector<vector<int>> &occupancy) {
-  long long tot = 0;
-  IntPoint pts[5];
-  int n = build_wire_points(candi, pts);
+static inline long long incremental_add_cost(int occ_value) {
+  // (n+1)^2 - n^2
+  return 2LL * occ_value + 1LL;
+}
 
-  for (int i = 0; i < n - 1; i++) {
-    int x = pts[i].x;
-    int y = pts[i].y;
-    int xn = pts[i + 1].x;
-    int yn = pts[i + 1].y;
-    int sx = (xn > x) ? 1 : (xn < x ? -1 : 0);
-    int sy = (yn > y) ? 1 : (yn < y ? -1 : 0);
+// ! function to evaluate the cost of choosing a given candidate route for a wire
+long long eval_cost(const std::vector<std::vector<int>> &occupancy,
+                    const std::vector<Route> &candidates,
+                    size_t candidate_index) {
+  assert(candidate_index < candidates.size());
+  const Route &route = candidates[candidate_index];
 
-    while (x != xn || y != yn) {
-      tot += incr_cost(occupancy[y][x]);
+  long long total = 0;
+
+  for (int seg = 0; seg + 1 < route.num_pts; ++seg) {
+    int x0 = route.pts[seg].x;
+    int y0 = route.pts[seg].y;
+    int x1 = route.pts[seg + 1].x;
+    int y1 = route.pts[seg + 1].y;
+
+    int sx = sign_dir(x1 - x0);
+    int sy = sign_dir(y1 - y0);
+
+    int x = x0, y = y0;
+    while (x != x1 || y != y1) {
+      total += incremental_add_cost(occupancy[y][x]);
       x += sx;
       y += sy;
     }
-    if (i == n - 2) tot += incr_cost(occupancy[y][x]);
-  }
 
-  return tot;
-}
-
-Candidate find_best_serial(const Wire &wire, const vector<vector<int>> &occupancy, double SA_prob, mt19937 &seed){
-  int total = count_candidates(wire);
-  uniform_real_distribution<double> rand0to1(0.0,1.0); //Random numb from 0.0 to 1.0
-  if(rand0to1(seed)<SA_prob){
-    uniform_int_distribution<int> pick(0, total - 1); //Pick random possible route
-    Wire w = candidate_from_id(wire, pick(seed));
-    return {route_add_cost(w,occupancy),w};
-  }
-  Candidate best{LLONG_MAX,wire};
-  for(int cid=0; cid<total; cid++){
-    Wire candi = candidate_from_id(wire,cid);
-    long long cost = route_add_cost(candi,occupancy);
-    if(cost<best.cost) best = {cost,candi};
-  }
-  return best;
-}
-
-
-static void collect_wire_tiles(const Wire &w, int tile_w, int tile_h, int tiles_x,
-                               vector<int>&tile_ids){
-  IntPoint pts[5];
-  int n = build_wire_points(w, pts);
-
-  for (int i = 0; i < n - 1; i++) {
-    int x = pts[i].x;
-    int y = pts[i].y;
-    int xn = pts[i + 1].x;
-    int yn = pts[i + 1].y;
-
-    // Each segment is axis-aligned collect touched tiles by tile range
-    int min_x = (x < xn) ? x : xn;
-    int max_x = (x > xn) ? x : xn;
-    int min_y = (y < yn) ? y : yn;
-    int max_y = (y > yn) ? y : yn;
-
-    int tx0 = min_x / tile_w;
-    int tx1 = max_x / tile_w;
-    int ty0 = min_y / tile_h;
-    int ty1 = max_y / tile_h;
-
-    for (int ty = ty0; ty <= ty1; ty++) {
-      for (int tx = tx0; tx <= tx1; tx++) {
-        tile_ids.push_back(ty * tiles_x + tx);
-      }
+    // Include final endpoint only for last segment.
+    if (seg + 2 == route.num_pts) {
+      total += incremental_add_cost(occupancy[y][x]);
     }
   }
+
+  return total;
 }
+
+// End of Helper functions
+// ========================================================================//
 
 int main(int argc, char *argv[]) {
   const auto init_start = std::chrono::steady_clock::now();
@@ -391,8 +424,14 @@ int main(int argc, char *argv[]) {
   std::cout << "Question Spec: dim_x=" << dim_x << ", dim_y=" << dim_y
             << ", number of wires=" << num_wires << '\n';
 
-  // TODO (student code start): Read the wire information from file, 
+  // 2D array for all wires possible candidate routes
+  std::vector<std::vector<Route>> wire_routes(num_wires);
+  wire_routes.reserve(num_wires);
+
+  // TODO (student code start): Read the wire information from file,
   // you may need to change this if you define the wire structure differently.
+
+   // ! 1. Randomize the initial routing of every wire by setting them to horizontal L shape first (i.e. go right to mid and then go down to end)
   for (auto &wire : wires) {
     fin >> wire.start_x >> wire.start_y >> wire.end_x >> wire.end_y;
     wire.move_x_start = true;
@@ -402,13 +441,20 @@ int main(int argc, char *argv[]) {
   }
 
   /* Initialize any additional data structures needed in the algorithm */
-  for (const auto &wire : wires) {
+
+  /*
+    TODO (student code start): Implement the wire routing algorithm here and
+    feel free to structure the algorithm into different functions.
+    Don't use global variables.
+    Use OpenMP to parallelize the algorithm.
+  */
+  std::mt19937 rng(std::random_device{}()); // seeding for a random number for probablistic on SA_prob
+
+  for(Wire &wire: wires){
+    // ! 2. Place the initialized wire routing cost into occupancy matrix
     apply_wire(wire, occupancy, 1);
   }
 
-
-  omp_set_dynamic(0);
-  omp_set_num_threads(num_threads);
   // Student code end
   const double init_time =
       std::chrono::duration_cast<std::chrono::duration<double>>(
@@ -418,174 +464,103 @@ int main(int argc, char *argv[]) {
             << std::setprecision(10) << init_time << '\n';
 
   const auto compute_start = std::chrono::steady_clock::now();
-
-  /* TODO (student code start): Implement the wire routing algorithm here and
-    feel free to structure the algorithm into different functions.
-    Don't use global variables.
-    Use OpenMP to parallelize the algorithm.
-  */
   
-  if (parallel_mode == 'W') {
-    // within wires
-    for (int SA_i = 0; SA_i < SA_iters; SA_i++) {
-      Wire wire;
-      int total=0;
-      Candidate global_best;
-      bool choose_random = false;
-      mt19937 sa_seed(418 + SA_i);
-
-      #pragma omp parallel shared(wires, occupancy, wire, total, global_best, choose_random, sa_seed)
-      {
-        for(int w = 0; w < (int)wires.size(); w++) {
-          #pragma omp single
-          {
-            wire = wires[w];
-            apply_wire(wire, occupancy, -1);
-            total = count_candidates(wire);
-            global_best = {LLONG_MAX, wire};
-
-            uniform_real_distribution<double> rand0to1(0.0, 1.0);
-            choose_random = (rand0to1(sa_seed) < SA_prob);
-            if (choose_random) {
-              uniform_int_distribution<int> pick(0, total - 1);
-              Wire random_route = candidate_from_id(wire, pick(sa_seed));
-              global_best = {0, random_route};
-            }
-          }
-
-          Candidate local_best{LLONG_MAX, wire};
-          if (!choose_random) {
-            #pragma omp for schedule(static)
-            for (int cid = 0; cid < total; cid++) {
-              Wire candi = candidate_from_id(wire, cid);
-              long long c = route_add_cost(candi, occupancy);
-
-              if (c < local_best.cost) {
-                local_best.cost = c;
-                local_best.route = candi;
-              }
-            }
-          }
-
-          if (!choose_random) {
-            #pragma omp critical
-            {
-              if (local_best.cost < global_best.cost) {
-                global_best = local_best;
-              }
-            }
-          }
-
-          #pragma omp barrier
-          #pragma omp single
-          {
-            wires[w] = global_best.route;
-            apply_wire(wires[w], occupancy, 1);
-          }
-        }
-      }
-    }
-    
-  } else {
-    // across wires
-    const int tile_w = 8; //tile width
-    const int tile_h = 8; //tile height
-    const int tiles_x = (dim_x + tile_w - 1) / tile_w; //# of tiles in a row
-    const int tiles_y = (dim_y + tile_h - 1) / tile_h; //# of tiles in a col
-    const int num_tile_locks = tiles_x * tiles_y;
-
-    vector<omp_lock_t> tile_locks(num_tile_locks);
-    for (int i = 0; i < num_tile_locks; i++) {
-      omp_init_lock(&tile_locks[i]);
-    }
-
-    for(int SA_i=0; SA_i<SA_iters; SA_i++){
-      int total = (int)wires.size();
-      std::atomic<int> batch_index(0);
-      #pragma omp parallel shared(batch_index, wires, occupancy)
-      {
-        mt19937 seed(omp_get_thread_num());
-        vector<int> batch_ids;
-        vector<Wire> old_wires;
-        vector<Wire> new_wires;
-        vector<int> touched_tiles;
-
-        while(true){
-          int start = batch_index.fetch_add(batch_size, memory_order_relaxed);
-          if (start>=total) break;
-          int end = min(start+batch_size,total);
-
-          batch_ids.clear(); //No need to realloc
-          old_wires.clear();
-          new_wires.clear();
-          batch_ids.reserve(end - start);
-          old_wires.reserve(end - start); //Store old routes
-          new_wires.reserve(end - start); //Store new routes
-
-          for(int i=start; i<end; i++){
-            Wire old_wire = wires[i];
-            Candidate best = find_best_serial(old_wire, occupancy, SA_prob, seed);
-            batch_ids.push_back(i);
-            old_wires.push_back(old_wire);
-            new_wires.push_back(best.route);
-          }
-
-          for(size_t k = 0; k<batch_ids.size(); k++){
-            touched_tiles.clear();
-            collect_wire_tiles(old_wires[k], tile_w, tile_h, tiles_x, touched_tiles);
-            collect_wire_tiles(new_wires[k], tile_w, tile_h, tiles_x, touched_tiles);
-            sort(touched_tiles.begin(), touched_tiles.end());
-            touched_tiles.erase(unique(touched_tiles.begin(), touched_tiles.end()),
-                                touched_tiles.end()); // Erase Duplicates
-
-            //Lock all tiles that are touched by old/new routes
-            for (int tile_id : touched_tiles) { 
-              omp_set_lock(&tile_locks[tile_id]);
-            }
-
-            apply_wire(old_wires[k], occupancy, -1);
-            wires[batch_ids[k]] = new_wires[k];
-            apply_wire(wires[batch_ids[k]], occupancy, 1);
-
-            for (int ti = (int)touched_tiles.size() - 1; ti >= 0; ti--) {
-              omp_unset_lock(&tile_locks[touched_tiles[ti]]);
-            }
-          }
-        }
-      }
-    }
-
-    for (int i = 0; i < num_tile_locks; i++) {
-      omp_destroy_lock(&tile_locks[i]);
-    }
+  // generate all route candidates for all wires
+  for (size_t w = 0; w < (size_t) num_wires; ++w) {
+    wire_routes[w] = generate_candidates(wires, w);
   }
 
-  // Student code end
-  // DON'T CHANGE THE FOLLOWING CODE
-  const double compute_time =
-      std::chrono::duration_cast<std::chrono::duration<double>>(
-          std::chrono::steady_clock::now() - compute_start)
-          .count();
-  std::cout << "Computation time (sec): " << compute_time << '\n';
 
-  /* wire to run check on wires and occupancy */
-  wr_checker checker(wires, occupancy);
-  checker.validate();
+  if (parallel_mode == 'W') {
+    // within wires
 
-  /* Write wires and occupancy matrix to files */
-  print_stats(occupancy);
-  write_output(wires, num_wires, occupancy, dim_x, dim_y);
+    for (size_t iter = 0; iter < (size_t) SA_iters; ++iter) {
+      for (size_t wire_index = 0; wire_index < (size_t) num_wires; ++wire_index) {
+        // If there is only one candidate route from this wire, we skip this
+        if (wire_routes[wire_index].size() == 1){
+          continue;
+        }
+
+        // ! if P is hit choose a route randomly from the set of all candidates
+        if (std::bernoulli_distribution(SA_prob)(rng)){
+          size_t random_index = std::uniform_int_distribution<std::size_t>(0, wire_routes[wire_index].size() - 1)(rng);
+          apply_wire(wires[wire_index], occupancy, -1);
+          wire_from_route(wires[wire_index], wire_routes[wire_index][random_index]);
+          apply_wire(wires[wire_index], occupancy, +1);
+          continue;
+        }
+
+        // ! path of non-random selection
+        // remove the current wire comtribution from occupancy matrix
+        apply_wire(wires[wire_index], occupancy, -1);
+
+        // store a global best route
+        Route best_route{};
+        long long global_best{LLONG_MAX};
+
+        // parallelize threads for candidate eval
+        #pragma omp parallel num_threads(num_threads) 
+        {
+          long long local_best{LLONG_MAX};
+          Route local_broute{};
+
+          // parallelize the next for loop via static assignment
+          #pragma omp for schedule(static)
+            for (size_t can_index = 0; can_index < wire_routes[wire_index].size(); ++can_index){
+              long long route_cost = eval_cost(occupancy, wire_routes[wire_index], can_index);
+              
+              // update thread best cost and route if found cheaper
+              if(route_cost < local_best){
+                local_best = route_cost;
+
+                // ! this read leads to a lot of shared address read on candidates
+                local_broute = wire_routes[wire_index][can_index];
+              }
+            }
+            
+            // critical update section
+            #pragma omp critical
+            {
+              // update best_cost if better
+              if(local_best < global_best){
+                global_best = local_best;
+                best_route = local_broute;
+              }
+            }
+        }
+
+        // ! update wire formation and occupancy matrix
+        wire_from_route(wires[wire_index], best_route);
+        apply_wire(wires[wire_index], occupancy, +1);
+      }
+    }
+  }
+  else {
+    // across wires
+  }
+
+// Student code end
+// DON'T CHANGE THE FOLLOWING CODE
+const double compute_time =
+    std::chrono::duration_cast<std::chrono::duration<double>>(
+        std::chrono::steady_clock::now() - compute_start)
+        .count();
+std::cout << "Computation time (sec): " << compute_time << '\n';
+
+/* wire to run check on wires and occupancy */
+wr_checker checker(wires, occupancy);
+checker.validate();
+
+/* Write wires and occupancy matrix to files */
+print_stats(occupancy);
+write_output(wires, num_wires, occupancy, dim_x, dim_y);
 }
 
-/* TODO (student): implement to_validate_format to convert Wire to
+/*
+  TODO (student): implement to_validate_format to convert Wire to
   validate_wire_t keypoint representation in order to run checker and
   write output
-  
 */
-struct Point {
-    int x;
-    int y;
-};
 
 // Helper to skip duplicates with the previous point
 static void add_point(std::vector<Point>& pts, int x, int y) {
