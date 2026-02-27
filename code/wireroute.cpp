@@ -474,64 +474,89 @@ int main(int argc, char *argv[]) {
   if (parallel_mode == 'W') {
     // within wires
 
-    for (size_t iter = 0; iter < (size_t) SA_iters; ++iter) {
-      for (size_t wire_index = 0; wire_index < (size_t) num_wires; ++wire_index) {
-        // If there is only one candidate route from this wire, we skip this
-        if (wire_routes[wire_index].size() == 1){
-          continue;
-        }
+    // thread-wise shared data
+    std::vector<long long> thread_best_cost(num_threads, LLONG_MAX);
+    std::vector<size_t> thread_best_idx(num_threads, 0);
 
-        // ! if P is hit choose a route randomly from the set of all candidates
-        if (std::bernoulli_distribution(SA_prob)(rng)){
-          size_t random_index = std::uniform_int_distribution<std::size_t>(0, wire_routes[wire_index].size() - 1)(rng);
-          apply_wire(wires[wire_index], occupancy, -1);
-          wire_from_route(wires[wire_index], wire_routes[wire_index][random_index]);
-          apply_wire(wires[wire_index], occupancy, +1);
-          continue;
-        }
+    bool skip_wire = false;
+    bool do_random = false;
+    size_t random_index = 0;
 
-        // ! path of non-random selection
-        // remove the current wire comtribution from occupancy matrix
-        apply_wire(wires[wire_index], occupancy, -1);
+    #pragma omp parallel num_threads(num_threads) shared(wires, occupancy, wire_routes, rng, SA_prob, SA_iters, num_wires, thread_best_cost, thread_best_idx, skip_wire, do_random, random_index)
+    {
+      int tid = omp_get_thread_num();
+      for (size_t iter = 0; iter < (size_t) SA_iters; ++iter) {
+        for (size_t wire_index = 0; wire_index < (size_t) num_wires; ++wire_index) {
+          // serial decisions/state mutation for this wire
+          #pragma omp single
+          {
+            skip_wire = false;
+            do_random = false;
+            random_index = 0;
 
-        // store a global best route
-        Route best_route{};
-        long long global_best{LLONG_MAX};
+              // If there is only one candidate route from this wire, we skip this
+            if (wire_routes[wire_index].size() == 1){
+              skip_wire = true;
+            }
+            // ! if P is hit choose a route randomly from the set of all candidates
+            else if (std::bernoulli_distribution(SA_prob)(rng)) {
+              do_random = true;
+              random_index =
+                std::uniform_int_distribution<size_t>(0, wire_routes[wire_index].size() - 1)(rng);
+              apply_wire(wires[wire_index], occupancy, -1);
+              wire_from_route(wires[wire_index], wire_routes[wire_index][random_index]);
+              apply_wire(wires[wire_index], occupancy, +1);
+            }
+            else{
+              // ! non-random path: remove old route once before candidate eval
+              apply_wire(wires[wire_index], occupancy, -1);
+            }
+          }
 
-        // parallelize threads for candidate eval
-        #pragma omp parallel num_threads(num_threads) 
-        {
+          if (skip_wire || do_random) {
+            continue;
+          }
+
+          // local best for current thread
           long long local_best{LLONG_MAX};
-          Route local_broute{};
+          size_t local_best_index = 0;
 
           // parallelize the next for loop via static assignment
           #pragma omp for schedule(static)
-            for (size_t can_index = 0; can_index < wire_routes[wire_index].size(); ++can_index){
-              long long route_cost = eval_cost(occupancy, wire_routes[wire_index], can_index);
-              
-              // update thread best cost and route if found cheaper
-              if(route_cost < local_best){
-                local_best = route_cost;
-
-                // ! this read leads to a lot of shared address read on candidates
-                local_broute = wire_routes[wire_index][can_index];
-              }
-            }
+          for (size_t can_index = 0; can_index < wire_routes[wire_index].size(); ++can_index){
+            long long route_cost = eval_cost(occupancy, wire_routes[wire_index], can_index);
             
-            // critical update section
-            #pragma omp critical
-            {
-              // update best_cost if better
-              if(local_best < global_best){
-                global_best = local_best;
-                best_route = local_broute;
+            // update thread best cost and route if found cheaper
+            if(route_cost < local_best){
+              local_best = route_cost;
+              local_best_index = can_index;
+            }
+          }
+
+          // publish per-thread result
+          thread_best_cost[tid] = local_best;
+          thread_best_idx[tid] = local_best_index;
+          
+          //#pragma omp barrier
+          
+          // serial merge + commit chosen route
+          #pragma omp single
+          {
+            long long global_best = LLONG_MAX;
+            size_t best_index = 0;
+
+            for (int t = 0; t < num_threads; ++t) {
+              if (thread_best_cost[t] < global_best) {
+                global_best = thread_best_cost[t];
+                best_index = thread_best_idx[t];
               }
             }
+            // ! update wire formation and occupancy matrix
+            wire_from_route(wires[wire_index], wire_routes[wire_index][best_index]);
+            apply_wire(wires[wire_index], occupancy, +1);
+          }
+          //#pragma omp barrier
         }
-
-        // ! update wire formation and occupancy matrix
-        wire_from_route(wires[wire_index], best_route);
-        apply_wire(wires[wire_index], occupancy, +1);
       }
     }
   }
