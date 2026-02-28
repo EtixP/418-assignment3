@@ -36,7 +36,7 @@ struct Route {
   struct Seg {
     int x0, y0, x1, y1;
     int sx, sy;
-  };  // segments are stored individually here such that we can quickly compute eval_cost_bounded function
+  };  // segments are stored individually here such that we can quickly compute eval_cost() function
   uint8_t num_pts;
   Point pts[5];
   Wire wire_repr;
@@ -304,7 +304,7 @@ static inline Route decode_candidate_from_cid(const Wire &base, size_t cid) {
 // We realize the assumption that: all Routes decoded via CID will get their Segment representation
 // stored inside route_from_wire call (from decode function). This step happens before eval function,
 // hence applicable for us to directly evaluate the cost of a Route using its Seg without reconstructing
-long long eval_cost_bounded(const std::vector<std::vector<int>> &occupancy,
+long long eval_cost(const std::vector<std::vector<int>> &occupancy,
                             const Route &route,
                             long long bound) {
   long long total = 0;
@@ -530,10 +530,6 @@ long long route_add_cost_bounded(const Wire &candi,
   return tot;
 }
 
-// If random SA branch triggers: picks a random candidate route.
-// Else: enumerates all candidate cids, decodes each to Route, computes cost with eval_cost_bounded, keeps the minimum.
-// Output: {best_cost, best_route} for that wire.
-// It is “serial” because one thread evaluates that wire's candidates sequentially (used in across mode).
 Candidate find_best_serial(const Wire &wire, const std::vector<std::vector<int>> &occupancy, double SA_prob, std::mt19937 &seed){
   int total = count_candidates_for_wire(wire);
   std::uniform_real_distribution<double> rand0to1(0.0,1.0); //Random numb from 0.0 to 1.0
@@ -790,7 +786,7 @@ int main(int argc, char *argv[]) {
           #pragma omp for schedule(static)
           for (size_t can_index = 0; can_index < current_route_count; ++can_index){
             const Route candidate_route = decode_candidate_from_cid(wires[wire_index], can_index);
-            long long route_cost = eval_cost_bounded(occupancy, candidate_route, local_best);
+            long long route_cost = eval_cost(occupancy, candidate_route, local_best);
             
             // update thread best cost and route if found cheaper
             if(route_cost < local_best){
@@ -839,7 +835,7 @@ int main(int argc, char *argv[]) {
   else {
     omp_set_dynamic(0);
     omp_set_num_threads(num_threads);
-    
+
     // across wires
     const int tile_w = 8; //tile width
     const int tile_h = 8; //tile height
