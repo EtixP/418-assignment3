@@ -1,6 +1,6 @@
 /**
  * Parallel VLSI Wire Routing via OpenMP
- * Name 1(andrew_id 1), Name 2(andrew_id 2)
+ * Jongsun Park (jongsunp), Dylan Sun(bdsun)
  */
 
 #include "wireroute.h"
@@ -354,6 +354,7 @@ struct Candidate{
   Wire route;    
 };
 
+// set up a candidate Wire object for the given base Wire
 Wire candidate_from_id(const Wire &base, int cid){
   int x0 = base.start_x, y0 = base.start_y;
   int x1 = base.end_x, y1 = base.end_y;
@@ -431,8 +432,10 @@ Wire candidate_from_id(const Wire &base, int cid){
   return w;
 }
 
+// computed incremented cost on occupancy matrix due to incrementing 1 at entry with value n
+// (n+1)^2 - n^2
 static long long incr_cost(int n) {
-  return 2LL*n + 1;  // (n+1)^2 - n^2
+  return 2LL*n + 1;
 }
 
 static void add_segment_cost(const std::vector<std::vector<int>> &occupancy,
@@ -530,6 +533,11 @@ long long route_add_cost_bounded(const Wire &candi,
   return tot;
 }
 
+// Evaluates one wire serially for across-wires mode.
+// With probability SA_prob, returns a random legal route.
+// Otherwise: uses current route as initial bound, probes up to 24 spread candidate IDs
+// to tighten the bound, then scans all candidates with bounded cost evaluation and
+// returns the minimum-cost candidate.
 Candidate find_best_serial(const Wire &wire, const std::vector<std::vector<int>> &occupancy, double SA_prob, std::mt19937 &seed){
   int total = count_candidates_for_wire(wire);
   std::uniform_real_distribution<double> rand0to1(0.0,1.0); //Random numb from 0.0 to 1.0
@@ -833,16 +841,17 @@ int main(int argc, char *argv[]) {
     // std::cout << "Profile candidate_eval (sec): " << t_candidate_eval << '\n';
   }
   else {
+    // across wires
     omp_set_dynamic(0);
     omp_set_num_threads(num_threads);
 
-    // across wires
     const int tile_w = 8; //tile width
     const int tile_h = 8; //tile height
     const int tiles_x = (dim_x + tile_w - 1) / tile_w; //# of tiles in a row
     const int tiles_y = (dim_y + tile_h - 1) / tile_h; //# of tiles in a col
     const int num_tile_locks = tiles_x * tiles_y;
 
+    // fine-grain lock on different tiles fo reach threads
     std::vector<omp_lock_t> tile_locks(num_tile_locks);
     for (int i = 0; i < num_tile_locks; i++) {
       omp_init_lock(&tile_locks[i]);
@@ -864,7 +873,7 @@ int main(int argc, char *argv[]) {
           if (start>=total) break;
           int end = std::min(start+batch_size,total);
 
-          batch_ids.clear(); //No need to realloc
+          batch_ids.clear(); 
           old_wires.clear();
           new_wires.clear();
           batch_ids.reserve(end - start);
@@ -873,6 +882,8 @@ int main(int argc, char *argv[]) {
 
           for(int i=start; i<end; i++){
             Wire old_wire = wires[i];
+
+            // core work loop inside find_best_serial
             Candidate best = find_best_serial(old_wire, occupancy, SA_prob, seed);
             batch_ids.push_back(i);
             old_wires.push_back(old_wire);
@@ -880,6 +891,8 @@ int main(int argc, char *argv[]) {
           }
 
           for(size_t k = 0; k<batch_ids.size(); k++){
+            // collect a deduplicated, sorted list of all tiles that might be modified when removing old wire and adding new wire.
+            // This ensures deadlock avoidance when we later do fine-grained locking, as we lock tiles via tile_id
             touched_tiles.clear();
             collect_wire_tiles(old_wires[k], tile_w, tile_h, tiles_x, touched_tiles);
             collect_wire_tiles(new_wires[k], tile_w, tile_h, tiles_x, touched_tiles);
@@ -904,6 +917,7 @@ int main(int argc, char *argv[]) {
       }
     }
 
+    // cleanup
     for (int i = 0; i < num_tile_locks; i++) {
       omp_destroy_lock(&tile_locks[i]);
     }
